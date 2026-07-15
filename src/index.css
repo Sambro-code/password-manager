@@ -113,9 +113,14 @@ button:focus-visible {
   border-radius: 50%;
   padding: 1px;
   background: var(--accent-gradient);
-  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask-composite: exclude;
+ mask: linear-gradient(#000 0 0) content-box,
+      linear-gradient(#000 0 0);
+
+-webkit-mask: linear-gradient(#000 0 0) content-box,
+              linear-gradient(#000 0 0);
+
+mask-composite: exclude;
+-webkit-mask-composite: xor;
   opacity: 0.55;
   animation: pulse-ring 3s ease-in-out infinite;
 }
