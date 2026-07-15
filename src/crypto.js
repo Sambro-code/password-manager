@@ -82,4 +82,14 @@ export function generateSalt() {
   return crypto.getRandomValues(new Uint8Array(16));
 }
 
+// Generates a fresh random 256-bit key — this becomes the actual vault encryption key
+export function generateRandomKeyBytes() {
+  return crypto.getRandomValues(new Uint8Array(32));
+}
+
+// Imports raw key bytes as a usable AES-GCM key (extractable, so we can re-wrap it later)
+export async function importRawAesKey(rawBytes) {
+  return crypto.subtle.importKey('raw', rawBytes, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
+}
+
 export { bytesToBase64, base64ToBytes };
