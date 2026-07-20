@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import './App.css';
 import { NativeBiometric } from '@capgo/capacitor-native-biometric';
 import {
@@ -14,7 +14,8 @@ import {
 import { vaultExists, loadVaultRaw, saveVaultRaw, isBiometricEnabled, setBiometricEnabled } from './storage.js';
 
 const BIOMETRIC_SERVER = 'password-manager-vault';
-const MIN_ANSWER_LENGTH = 10;
+const MIN_ANSWER_LENGTH = 4;
+const AUTO_LOCK_MS = 30000; // 30 seconds of inactivity
 
 const SECURITY_QUESTIONS = [
   'What was the name of your first pet?',
@@ -82,6 +83,15 @@ function IconTrash({ size = 16 }) {
   );
 }
 
+function IconEdit({ size = 16 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
+    </svg>
+  );
+}
+
 function App() {
   const [isNewVault, setIsNewVault] = useState(null);
   const [unlocked, setUnlocked] = useState(false);
@@ -98,6 +108,12 @@ function App() {
   const [showNewPassword, setShowNewPassword] = useState(false);
   const [visiblePasswordIds, setVisiblePasswordIds] = useState(new Set());
   const [copiedFeedback, setCopiedFeedback] = useState(null);
+
+  // --- Edit mode ---
+  const [editingEntryId, setEditingEntryId] = useState(null);
+
+  // --- Delete confirmation ---
+  const [entryPendingDelete, setEntryPendingDelete] = useState(null);
 
   // --- Security question (set up during vault creation) ---
   const [setupStep, setSetupStep] = useState('password');
@@ -120,6 +136,8 @@ function App() {
   const [showBiometricOptIn, setShowBiometricOptIn] = useState(false);
   const [pendingPasswordForBiometric, setPendingPasswordForBiometric] = useState('');
   const [biometricBusy, setBiometricBusy] = useState(false);
+
+  const autoLockTimerRef = useRef(null);
 
   useEffect(() => {
     setIsNewVault(!vaultExists());
@@ -431,29 +449,83 @@ function App() {
     maybeOfferBiometricOptIn(usedPassword);
   }
 
-  function handleRelock() {
+  const handleRelock = useCallback(() => {
     setUnlocked(false);
     setEncryptionKey(null);
     setEntries([]);
     setMasterPasswordInput('');
     setVisiblePasswordIds(new Set());
     setAuthView('unlock');
-  }
+    setEditingEntryId(null);
+    setEntryPendingDelete(null);
+    setSiteName('');
+    setUsername('');
+    setPassword('');
+    setShowNewPassword(false);
+  }, []);
 
-  function addEntry() {
+  // --- Auto-lock: after 30s of no activity, or instantly when the screen/app is hidden ---
+  useEffect(() => {
+    if (!unlocked) {
+      if (autoLockTimerRef.current) {
+        clearTimeout(autoLockTimerRef.current);
+        autoLockTimerRef.current = null;
+      }
+      return;
+    }
+
+    function resetTimer() {
+      if (autoLockTimerRef.current) clearTimeout(autoLockTimerRef.current);
+      autoLockTimerRef.current = setTimeout(() => {
+        handleRelock();
+      }, AUTO_LOCK_MS);
+    }
+
+    function handleVisibilityChange() {
+      if (document.hidden) {
+        // Screen turned off / app moved to background — lock immediately
+        handleRelock();
+      } else {
+        resetTimer();
+      }
+    }
+
+    const activityEvents = ['mousedown', 'keydown', 'touchstart', 'scroll'];
+    activityEvents.forEach((evt) => window.addEventListener(evt, resetTimer));
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('blur', () => handleRelock());
+
+    resetTimer();
+
+    return () => {
+      activityEvents.forEach((evt) => window.removeEventListener(evt, resetTimer));
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      if (autoLockTimerRef.current) clearTimeout(autoLockTimerRef.current);
+    };
+  }, [unlocked, handleRelock]);
+
+  function addOrUpdateEntry() {
     if (!siteName || !username || !password) {
       alert('Please fill in all fields');
       return;
     }
 
-    const newEntry = {
-      id: Date.now(),
-      site: siteName,
-      username: username,
-      password: password,
-    };
-
-    setEntries([...entries, newEntry]);
+    if (editingEntryId !== null) {
+      setEntries(
+        entries.map((entry) =>
+          entry.id === editingEntryId ? { ...entry, site: siteName, username, password } : entry
+        )
+      );
+      setEditingEntryId(null);
+    } else {
+      const newEntry = {
+        id: Date.now(),
+        site: siteName,
+        username: username,
+        password: password,
+      };
+      setEntries([...entries, newEntry]);
+    }
 
     setSiteName('');
     setUsername('');
@@ -461,8 +533,39 @@ function App() {
     setShowNewPassword(false);
   }
 
-  function deleteEntry(idToDelete) {
-    setEntries(entries.filter((entry) => entry.id !== idToDelete));
+  function startEditEntry(entry) {
+    setEditingEntryId(entry.id);
+    setSiteName(entry.site);
+    setUsername(entry.username);
+    setPassword(entry.password);
+    setShowNewPassword(false);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  function cancelEdit() {
+    setEditingEntryId(null);
+    setSiteName('');
+    setUsername('');
+    setPassword('');
+    setShowNewPassword(false);
+  }
+
+  function requestDeleteEntry(entry) {
+    setEntryPendingDelete(entry);
+  }
+
+  function confirmDeleteEntry() {
+    if (entryPendingDelete) {
+      setEntries(entries.filter((entry) => entry.id !== entryPendingDelete.id));
+      if (editingEntryId === entryPendingDelete.id) {
+        cancelEdit();
+      }
+    }
+    setEntryPendingDelete(null);
+  }
+
+  function cancelDeleteEntry() {
+    setEntryPendingDelete(null);
   }
 
   function toggleEntryPasswordVisibility(entryId) {
@@ -730,7 +833,9 @@ function App() {
       </div>
 
       <div className="add-panel">
-        <p className="add-panel-label">Add a credential</p>
+        <p className="add-panel-label">
+          {editingEntryId !== null ? 'Edit credential' : 'Add a credential'}
+        </p>
         <div className="add-form">
           <input
             type="text"
@@ -762,9 +867,15 @@ function App() {
             </button>
           </div>
 
-          <button className="btn-primary" onClick={addEntry}>
-            Add entry
+          <button className="btn-primary" onClick={addOrUpdateEntry}>
+            {editingEntryId !== null ? 'Save changes' : 'Add entry'}
           </button>
+
+          {editingEntryId !== null && (
+            <button className="link-btn" onClick={cancelEdit}>
+              Cancel edit
+            </button>
+          )}
         </div>
       </div>
 
@@ -775,12 +886,17 @@ function App() {
       )}
 
       {entries.map((entry) => (
-        <div className="entry-card" key={entry.id}>
+        <div className={`entry-card ${editingEntryId === entry.id ? 'entry-card-editing' : ''}`} key={entry.id}>
           <div className="entry-top">
             <span className="entry-site">{entry.site}</span>
-            <button className="delete-btn" onClick={() => deleteEntry(entry.id)} aria-label="Delete entry">
-              <IconTrash />
-            </button>
+            <div style={{ display: 'flex', gap: '2px' }}>
+              <button className="icon-btn" onClick={() => startEditEntry(entry)} aria-label="Edit entry">
+                <IconEdit />
+              </button>
+              <button className="delete-btn" onClick={() => requestDeleteEntry(entry)} aria-label="Delete entry">
+                <IconTrash />
+              </button>
+            </div>
           </div>
 
           <div className="entry-field">
@@ -817,6 +933,25 @@ function App() {
           </div>
         </div>
       ))}
+
+      {entryPendingDelete && (
+        <div className="modal-overlay" onClick={cancelDeleteEntry}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <h2>Delete this credential?</h2>
+            <p className="subtitle" style={{ margin: '0 0 22px' }}>
+              This will permanently remove <strong>{entryPendingDelete.site}</strong> from your vault. This can't be undone.
+            </p>
+            <div className="modal-actions">
+              <button className="lock-btn" onClick={cancelDeleteEntry}>
+                No, keep it
+              </button>
+              <button className="btn-danger" onClick={confirmDeleteEntry}>
+                Yes, delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
