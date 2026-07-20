@@ -14,7 +14,7 @@ import {
 import { vaultExists, loadVaultRaw, saveVaultRaw, isBiometricEnabled, setBiometricEnabled } from './storage.js';
 
 const BIOMETRIC_SERVER = 'password-manager-vault';
-const MIN_ANSWER_LENGTH = 4;
+const MIN_ANSWER_LENGTH = 1;
 const AUTO_LOCK_MS = 30000; // 30 seconds of inactivity
 
 const SECURITY_QUESTIONS = [
@@ -114,6 +114,14 @@ function App() {
 
   // --- Delete confirmation ---
   const [entryPendingDelete, setEntryPendingDelete] = useState(null);
+
+  // --- Change master password (while already unlocked) ---
+  const [showChangePassword, setShowChangePassword] = useState(false);
+  const [currentPasswordInput, setCurrentPasswordInput] = useState('');
+  const [changeNewPasswordInput, setChangeNewPasswordInput] = useState('');
+  const [changeConfirmPasswordInput, setChangeConfirmPasswordInput] = useState('');
+  const [changePasswordError, setChangePasswordError] = useState('');
+  const [changePasswordSuccess, setChangePasswordSuccess] = useState(false);
 
   // --- Security question (set up during vault creation) ---
   const [setupStep, setSetupStep] = useState('password');
@@ -222,7 +230,7 @@ function App() {
 
     const normalizedAnswer = normalizeAnswer(securityAnswerInput);
     if (normalizedAnswer.length < MIN_ANSWER_LENGTH) {
-      setErrorMessage(`Answer must be at least ${MIN_ANSWER_LENGTH} characters — a made-up phrase works well`);
+      setErrorMessage(`Answer must be at least ${MIN_ANSWER_LENGTH} character${MIN_ANSWER_LENGTH > 1 ? 's' : ''}`);
       return;
     }
     if (normalizedAnswer !== normalizeAnswer(confirmAnswerInput)) {
@@ -449,6 +457,78 @@ function App() {
     maybeOfferBiometricOptIn(usedPassword);
   }
 
+  function openChangePassword() {
+    setCurrentPasswordInput('');
+    setChangeNewPasswordInput('');
+    setChangeConfirmPasswordInput('');
+    setChangePasswordError('');
+    setChangePasswordSuccess(false);
+    setShowChangePassword(true);
+  }
+
+  function closeChangePassword() {
+    setShowChangePassword(false);
+    setCurrentPasswordInput('');
+    setChangeNewPasswordInput('');
+    setChangeConfirmPasswordInput('');
+    setChangePasswordError('');
+  }
+
+  async function handleChangeMasterPassword() {
+    setChangePasswordError('');
+
+    const vault = loadVaultRaw();
+
+    // Verify the current password is correct before allowing a change
+    try {
+      const saltPassword = base64ToBytes(vault.saltPassword);
+      const currentKey = await deriveKeyFromPassword(currentPasswordInput, saltPassword);
+      await decryptText(vault.wrappedKeyPassword.cipherText, vault.wrappedKeyPassword.iv, currentKey);
+    } catch {
+      setChangePasswordError('Current password is incorrect.');
+      return;
+    }
+
+    if (changeNewPasswordInput.length < 6) {
+      setChangePasswordError('New password must be at least 6 characters');
+      return;
+    }
+    if (changeNewPasswordInput !== changeConfirmPasswordInput) {
+      setChangePasswordError('New passwords do not match');
+      return;
+    }
+
+    // Re-wrap the same vault encryption key under the new password
+    const mekRawBuffer = await crypto.subtle.exportKey('raw', encryptionKey);
+    const mekBase64 = bytesToBase64(new Uint8Array(mekRawBuffer));
+
+    const newSaltPassword = generateSalt();
+    const newPasswordKey = await deriveKeyFromPassword(changeNewPasswordInput, newSaltPassword);
+    const newWrappedKeyPassword = await encryptText(mekBase64, newPasswordKey);
+
+    saveVaultRaw({
+      ...vault,
+      saltPassword: bytesToBase64(newSaltPassword),
+      wrappedKeyPassword: newWrappedKeyPassword,
+    });
+
+    // Fingerprint was tied to the old password — clear it for safety
+    if (isBiometricEnabled()) {
+      try {
+        await NativeBiometric.deleteCredentials({ server: BIOMETRIC_SERVER });
+      } catch {
+        // ignore
+      }
+      setBiometricEnabled(false);
+      setBiometricEnabledState(false);
+    }
+
+    setCurrentPasswordInput('');
+    setChangeNewPasswordInput('');
+    setChangeConfirmPasswordInput('');
+    setChangePasswordSuccess(true);
+  }
+
   const handleRelock = useCallback(() => {
     setUnlocked(false);
     setEncryptionKey(null);
@@ -462,6 +542,7 @@ function App() {
     setUsername('');
     setPassword('');
     setShowNewPassword(false);
+    setShowChangePassword(false);
   }, []);
 
   // --- Auto-lock: after 30s of no activity, or instantly when the screen/app is hidden ---
@@ -689,7 +770,7 @@ function App() {
                 <p className="field-note">Your answer</p>
                 <input
                   type="text"
-                  placeholder={`At least ${MIN_ANSWER_LENGTH} characters`}
+                  placeholder={`At least ${MIN_ANSWER_LENGTH} character${MIN_ANSWER_LENGTH > 1 ? 's' : ''}`}
                   value={securityAnswerInput}
                   onChange={(e) => setSecurityAnswerInput(e.target.value)}
                 />
@@ -826,6 +907,9 @@ function App() {
               <IconFingerprint size={13} /> Disable
             </button>
           )}
+          <button className="lock-btn" onClick={openChangePassword}>
+            Change password
+          </button>
           <button className="lock-btn" onClick={handleRelock}>
             <IconLock size={13} /> Lock
           </button>
@@ -933,6 +1017,65 @@ function App() {
           </div>
         </div>
       ))}
+
+      {showChangePassword && (
+        <div className="modal-overlay" onClick={closeChangePassword}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            {changePasswordSuccess ? (
+              <>
+                <h2>Password changed</h2>
+                <p className="subtitle" style={{ margin: '0 0 22px' }}>
+                  Your master password has been updated. Use your new password next time you unlock the vault.
+                </p>
+                <button className="btn-primary" onClick={closeChangePassword}>
+                  Done
+                </button>
+              </>
+            ) : (
+              <>
+                <h2>Change master password</h2>
+                <p className="subtitle" style={{ margin: '0 0 18px' }}>
+                  Enter your current password, then choose a new one.
+                </p>
+
+                <div className="gate-form">
+                  <input
+                    type="password"
+                    placeholder="Current password"
+                    value={currentPasswordInput}
+                    onChange={(e) => setCurrentPasswordInput(e.target.value)}
+                    autoFocus
+                  />
+                  <input
+                    type="password"
+                    placeholder="New password"
+                    value={changeNewPasswordInput}
+                    onChange={(e) => setChangeNewPasswordInput(e.target.value)}
+                  />
+                  <input
+                    type="password"
+                    placeholder="Confirm new password"
+                    value={changeConfirmPasswordInput}
+                    onChange={(e) => setChangeConfirmPasswordInput(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && handleChangeMasterPassword()}
+                  />
+
+                  {changePasswordError && <p className="error-text">{changePasswordError}</p>}
+
+                  <div className="modal-actions">
+                    <button className="lock-btn" onClick={closeChangePassword}>
+                      Cancel
+                    </button>
+                    <button className="btn-primary" onClick={handleChangeMasterPassword}>
+                      Save
+                    </button>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       {entryPendingDelete && (
         <div className="modal-overlay" onClick={cancelDeleteEntry}>
